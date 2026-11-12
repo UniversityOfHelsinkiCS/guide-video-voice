@@ -1,0 +1,113 @@
+name: Publish
+
+# Builds and tests the image on master, a published release pushes it to the registry, see README.md
+on:
+  push:
+    branches: [master]
+    paths-ignore: ["**.md"]
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: registry.version.helsinki.fi/toska/openshift/kontit/guide-video-voice
+
+jobs:
+  # Runs the packages' code without secrets
+  build:
+    if: ${{ github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v') || github.event_name == 'push' && github.actor != 'renovate[bot]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      # v1.2.0 is pushed as 1.2.0, master builds are dev
+      - name: Version
+        id: version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [ -n "$TAG" ]; then version="${TAG#v}"; else version=dev; fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Downloads the model weights, about 30 minutes
+      - name: Build
+        run: docker build --build-arg VERSION="$VERSION" -t "$IMAGE:$VERSION" .
+
+      - name: Check that it speaks
+        run: |
+          docker run -d --name voice -p 127.0.0.1:5005:5005 --read-only --tmpfs /tmp "$IMAGE:$VERSION"
+          timeout 300 bash -c 'until curl -sf http://localhost:5005/health; do sleep 5; done'
+          curl -sf --max-time 300 -X POST http://localhost:5005/synthesize \
+            -H 'Content-Type: application/json' -d '{"text": "Tämä on testi.", "lang": "fi"}' -o test.wav
+          [ "$(head -c 4 test.wav)" = RIFF ] || { echo "/synthesize returned no WAV"; exit 1; }
+
+      - name: Voice service logs
+        if: failure()
+        run: docker logs voice || true
+
+      # The push job pushes this tested image, not a rebuild
+      - name: Save the image
+        if: ${{ github.event_name == 'release' }}
+        run: |
+          docker rm -f voice
+          docker save -o image.tar "$IMAGE:$VERSION"
+
+      # The weights do not compress
+      - uses: actions/upload-artifact@v7
+        if: ${{ github.event_name == 'release' }}
+        with:
+          name: image
+          path: image.tar
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+  push:
+    needs: build
+    if: ${{ github.event_name == 'release' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions: {}
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: image
+
+      - name: Load the image
+        run: |
+          docker load -i image.tar
+          rm image.tar
+
+      - name: Log in to the registry
+        uses: docker/login-action@v4
+        with:
+          registry: registry.version.helsinki.fi
+          username: kontit
+          password: ${{ secrets.VERSION_PUSH_SECRET }}
+
+      # A version is never replaced, apps cache their clips by it
+      - name: Check the version is new
+        run: |
+          if docker manifest inspect "$IMAGE:$VERSION" >/dev/null 2>&1; then
+            echo "$IMAGE:$VERSION already exists"
+            exit 1
+          fi
+
+      - name: Push
+        run: docker push "$IMAGE:$VERSION"
+
+      - name: Log out of the registry
+        if: always()
+        run: docker logout registry.version.helsinki.fi
